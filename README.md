@@ -5,7 +5,7 @@ A production-grade AI developer tool that indexes your entire codebase and answe
 
 Built as a VS Code extension backed by a local Python sidecar using a multi-agent RAG pipeline. Fully free, fully local, fully private.
 
-![Demo](docs/demo.png)
+
 
 ## What it does
 
