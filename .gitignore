@@ -1,0 +1,9 @@
+.venv/
+data/
+backend/.env
+__pycache__/
+*.pyc
+.chroma/
+node_modules/
+vscode-extension/out/
+*.vsix

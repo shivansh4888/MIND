@@ -1,0 +1,72 @@
+
+{
+  "name": "codebase-agent",
+  "displayName": "Codebase Agent",
+  "description": "AI assistant that understands your entire codebase",
+  "version": "0.1.0",
+  "publisher": "local-dev",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/codebase-agent"
+  },
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["AI", "Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [{
+        "id": "codebase-agent",
+        "title": "Codebase Agent",
+        "icon": "media/icon.svg"
+      }]
+    },
+    "views": {
+      "codebase-agent": [{
+        "type": "webview",
+        "id": "codebaseAgent.chatView",
+        "name": "Ask your codebase"
+      }]
+    },
+    "commands": [
+      {
+        "command": "codebaseAgent.indexWorkspace",
+        "title": "Codebase Agent: Index This Workspace"
+      },
+      {
+        "command": "codebaseAgent.indexFolder",
+        "title": "Codebase Agent: Index a Folder..."
+      },
+      {
+        "command": "codebaseAgent.clearIndex",
+        "title": "Codebase Agent: Clear Index"
+      }
+    ],
+    "configuration": {
+      "title": "Codebase Agent",
+      "properties": {
+        "codebaseAgent.serverPort": {
+          "type": "number",
+          "default": 57384,
+          "description": "Port the Python sidecar server runs on"
+        },
+        "codebaseAgent.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to codebase-agent project root (where run_server.py lives)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.0.0",
+    "@vscode/vsce": "^2.0.0"
+  }
+}
