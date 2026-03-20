@@ -6,7 +6,6 @@ import tree_sitter_python as tspython
 import tree_sitter_javascript as tsjavascript
 
 from backend.models.schemas import CodeChunk, Language
-from backend.utils.config import config
 
 # Build grammars once at import time
 PY_LANGUAGE  = TSLanguage(tspython.language())

@@ -1,0 +1,49 @@
+{
+  "title": "Codebase Agent",
+  "uid": "codebase-agent-v1",
+  "schemaVersion": 38,
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Total queries",
+      "gridPos": {"x":0,"y":0,"w":6,"h":4},
+      "targets": [{"expr": "sum(http_requests_total{path='/query'})", "legendFormat": "queries"}],
+      "options": {"colorMode": "value", "graphMode": "area"}
+    },
+    {
+      "id": 2, "type": "stat", "title": "p95 query latency",
+      "gridPos": {"x":6,"y":0,"w":6,"h":4},
+      "targets": [{"expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{path='/query'}[5m]))", "legendFormat": "p95"}],
+      "options": {"colorMode": "value", "graphMode": "area"},
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "id": 3, "type": "stat", "title": "Chunks indexed",
+      "gridPos": {"x":12,"y":0,"w":6,"h":4},
+      "targets": [{"expr": "codebase_agent_chunks_indexed_total", "legendFormat": "chunks"}],
+      "options": {"colorMode": "value"}
+    },
+    {
+      "id": 4, "type": "stat", "title": "LLM calls total",
+      "gridPos": {"x":18,"y":0,"w":6,"h":4},
+      "targets": [{"expr": "codebase_agent_llm_calls_total", "legendFormat": "LLM calls"}],
+      "options": {"colorMode": "value"}
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Request rate (req/min)",
+      "gridPos": {"x":0,"y":4,"w":12,"h":8},
+      "targets": [{"expr": "rate(http_requests_total[1m]) * 60", "legendFormat": "{{path}}"}]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Query latency percentiles",
+      "gridPos": {"x":12,"y":4,"w":12,"h":8},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, rate(http_request_duration_seconds_bucket{path='/query'}[5m]))", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{path='/query'}[5m]))", "legendFormat": "p95"},
+        {"expr": "histogram_quantile(0.99, rate(http_request_duration_seconds_bucket{path='/query'}[5m]))", "legendFormat": "p99"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    }
+  ],
+  "time": {"from": "now-1h", "to": "now"},
+  "refresh": "10s"
+}

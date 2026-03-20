@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: codebase-agent
+    folder: Codebase Agent
+    type: file
+    options:
+      path: /etc/grafana/dashboards
