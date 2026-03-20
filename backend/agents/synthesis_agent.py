@@ -55,12 +55,45 @@ def _extract_citations(answer: str, results: list[SearchResult]) -> list[dict]:
     return citations
 
 
+def _try_langfuse_trace(lf, question: str, chunks: int, answer: str,
+                        elapsed: float, usage, citations: list):
+    """Best-effort Langfuse tracing — never raises, never blocks the query."""
+    try:
+        # Support both Langfuse v2 (trace) and v3 (start_trace)
+        if hasattr(lf, "start_trace"):
+            trace = lf.start_trace(name="query")
+        elif hasattr(lf, "trace"):
+            trace = lf.trace(name="query", input={"question": question})
+        else:
+            return
+
+        span_input = {
+            "question":  question,
+            "model":     config.LLM_MODEL,
+            "chunks":    chunks,
+            "latency_s": round(elapsed, 3),
+        }
+        if usage:
+            span_input["prompt_tokens"]     = usage.prompt_tokens
+            span_input["completion_tokens"] = usage.completion_tokens
+
+        if hasattr(trace, "span"):
+            span = trace.span(name="groq-llm", input=span_input)
+            span.end(output={"answer_length": len(answer), "citations": len(citations)})
+
+        if hasattr(trace, "update"):
+            trace.update(output={"answer": answer[:300], "citations": len(citations)})
+
+        lf.flush()
+    except Exception as e:
+        print(f"[telemetry] Langfuse trace failed (non-fatal): {e}")
+
+
 class SynthesisAgent:
     def __init__(self):
         self.client = Groq(api_key=config.GROQ_API_KEY)
 
     def answer(self, question: str, results: list[SearchResult]) -> AgentResponse:
-        # ── Prometheus retrieval metric ───────────────────────────
         RETRIEVAL_RESULTS.observe(len(results))
 
         if not results:
@@ -69,7 +102,7 @@ class SynthesisAgent:
                 citations=[], chunks_used=0, model_used=config.LLM_MODEL,
             )
 
-        context      = _build_context(results)
+        context = _build_context(results)
         user_message = f"""Here are the relevant code chunks from the codebase:
 
 {context}
@@ -79,14 +112,9 @@ Developer question: {question}
 
 Answer with specific file paths and line numbers."""
 
-        # ── Langfuse trace ────────────────────────────────────────
-        lf      = get_langfuse()
-        trace   = lf.trace(name="query", input={"question": question}) if lf else None
-        span    = trace.span(name="groq-llm", input={"model": config.LLM_MODEL, "chunks": len(results)}) if trace else None
-
-        # ── LLM call ─────────────────────────────────────────────
         LLM_CALLS.inc()
         t0 = time.perf_counter()
+
         try:
             response = self.client.chat.completions.create(
                 model=config.LLM_MODEL,
@@ -100,35 +128,20 @@ Answer with specific file paths and line numbers."""
             answer_text = response.choices[0].message.content or ""
             usage       = response.usage
         except Exception as e:
-            if span:
-                span.end(output={"error": str(e)}, level="ERROR")
-            if trace:
-                trace.update(output={"error": str(e)})
-            if lf:
-                lf.flush()
             return AgentResponse(
                 answer=f"LLM error: {str(e)}",
                 citations=[], chunks_used=len(results), model_used=config.LLM_MODEL,
             )
 
-        elapsed = time.perf_counter() - t0
+        elapsed  = time.perf_counter() - t0
         LLM_LATENCY.observe(elapsed)
-
-        # ── Langfuse span end ─────────────────────────────────────
-        if span:
-            span.end(output={
-                "answer_length": len(answer_text),
-                "latency_s":     round(elapsed, 3),
-                "prompt_tokens": usage.prompt_tokens if usage else 0,
-                "completion_tokens": usage.completion_tokens if usage else 0,
-            })
-        if trace:
-            citations = _extract_citations(answer_text, results)
-            trace.update(output={"answer": answer_text[:300], "citations": len(citations)})
-        if lf:
-            lf.flush()
-
         citations = _extract_citations(answer_text, results)
+
+        # Best-effort tracing — if Langfuse isn't configured or API changed, skip silently
+        lf = get_langfuse()
+        if lf:
+            _try_langfuse_trace(lf, question, len(results), answer_text, elapsed, usage, citations)
+
         return AgentResponse(
             answer=answer_text,
             citations=citations,

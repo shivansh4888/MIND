@@ -1,26 +1,6 @@
-version: "3.9"
+
 
 services:
-
-  server:
-    build: .
-    container_name: codebase-agent-server
-    ports:
-      - "57384:57384"
-    env_file:
-      - backend/.env
-    environment:
-      - CHROMA_PATH=/app/data/chroma
-      - SQLITE_PATH=/app/data/symbols.db
-    volumes:
-      - agent_data:/app/data
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:57384/health')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
   prometheus:
     image: prom/prometheus:latest
     container_name: codebase-agent-prometheus
@@ -28,6 +8,8 @@ services:
       - "9090:9090"
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
   grafana:
@@ -49,5 +31,4 @@ services:
       - prometheus
 
 volumes:
-  agent_data:
   grafana_data:
