@@ -5,7 +5,7 @@
   "description": "AI assistant that understands your entire codebase",
   "version": "0.1.0",
   "publisher": "local-dev",
-  "license": "MIT",
+  
   "repository": {
     "type": "git",
     "url": "https://github.com/yourusername/codebase-agent"
@@ -14,6 +14,12 @@
   "categories": ["AI", "Other"],
   "activationEvents": ["onStartupFinished"],
   "main": "./out/extension.js",
+  "files": [
+    "out/**",
+    "media/**",
+    "server/**",
+    "package.json"
+  ],
   "contributes": {
     "viewsContainers": {
       "activitybar": [{
@@ -41,6 +47,10 @@
       {
         "command": "codebaseAgent.clearIndex",
         "title": "Codebase Agent: Clear Index"
+      },
+      {
+        "command": "codebaseAgent.setGroqApiKey",
+        "title": "Codebase Agent: Set Groq API Key"
       }
     ],
     "configuration": {
@@ -54,14 +64,21 @@
         "codebaseAgent.serverPath": {
           "type": "string",
           "default": "",
-          "description": "Absolute path to codebase-agent project root (where run_server.py lives)"
+          "description": "Optional override for the bundled Python server root"
+        },
+        "codebaseAgent.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional override for the Python executable used to create the extension runtime"
         }
       }
     }
   },
   "scripts": {
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "prepare-server": "node ./scripts/prepare-server.mjs",
+    "compile": "npm run prepare-server && tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

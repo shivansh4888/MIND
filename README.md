@@ -51,45 +51,30 @@ Cohere Embed
 ### Prerequisites
 
 - Python 3.10+
-- Node.js 18+
 - VS Code 1.85+
-- Free API keys: [Groq](https://console.groq.com) · [Cohere](https://dashboard.cohere.com)
+- A free [Groq API key](https://console.groq.com)
+- Optional: a [Cohere API key](https://dashboard.cohere.com) if you want semantic embeddings instead of Groq-only keyword retrieval
 
-### 1. Clone and set up
+### 1. Build the extension
 ```bash
 git clone https://github.com/yourusername/codebase-agent
 cd codebase-agent
-python3 -m venv .venv && source .venv/bin/activate
-pip install fastapi uvicorn chromadb cohere groq tree-sitter \
-    tree-sitter-python tree-sitter-javascript watchdog rank-bm25 \
-    pydantic python-dotenv aiofiles
-```
-
-### 2. Configure API keys
-```bash
-cp backend/.env.example backend/.env
-# Edit backend/.env and add your Groq and Cohere API keys
-```
-
-### 3. Start the sidecar server
-```bash
-python3 run_server.py
-```
-
-### 4. Install the VS Code extension
-```bash
 cd vscode-extension
 npm install && npx tsc -p ./
 npx @vscode/vsce package --no-dependencies
 code --install-extension codebase-agent-0.1.0.vsix
 ```
 
-### 5. Use it
+### 2. Use it
 
 - Open any Python or JS/TS project in VS Code
 - Click the Codebase Agent icon in the Activity Bar
+- When prompted, paste your Groq API key once
+- Wait for the extension to create its own local Python environment and start the sidecar automatically
 - Click **Index workspace**
 - Ask anything about your code
+
+The extension now manages its own local server runtime under VS Code storage. Users no longer need to clone the repo separately, hand-edit `.env`, or start `run_server.py` themselves.
 
 ## API endpoints
 
@@ -136,4 +121,3 @@ codebase-agent/
 ├── run_server.py                 # Server entrypoint
 └── README.md
 ```
-

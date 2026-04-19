@@ -1,16 +1,16 @@
 import * as vscode from "vscode";
 import * as http from "http";
 import * as path from "path";
+import * as fs from "fs/promises";
 import { ChildProcess, spawn } from "child_process";
+
+const GROQ_SECRET_KEY = "groq_api_key";
+const SERVER_START_TIMEOUT_MS = 45_000;
 
 const SERVER_PORT = () =>
   vscode.workspace
     .getConfiguration("codebaseAgent")
     .get<number>("serverPort", 57384);
-
-// ------------------------------------------------------------------ //
-//  HTTP helpers (Node built-in, no extra deps)                        //
-// ------------------------------------------------------------------ //
 
 function httpPost(endpoint: string, body: object): Promise<any> {
   return new Promise((resolve, reject) => {
@@ -70,8 +70,6 @@ function httpGet(endpoint: string): Promise<any> {
   });
 }
 
-// NEW: proper httpDelete helper — the old code inlined a raw http.request
-// in clearIndex() and never resolved it properly.
 function httpDelete(endpoint: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const req = http.request(
@@ -100,9 +98,9 @@ async function isServerRunning(): Promise<boolean> {
   }
 }
 
-// ------------------------------------------------------------------ //
-//  Webview panel                                                       //
-// ------------------------------------------------------------------ //
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function getWebviewContent(): string {
   return `<!DOCTYPE html>
@@ -173,7 +171,7 @@ function getWebviewContent(): string {
   <button class="secondary" onclick="clearIndex()">Clear index</button>
 </div>
 <div id="workspace-label">Workspace: &mdash;</div>
-<div id="status">Not connected &mdash; make sure the sidecar server is running.</div>
+<div id="status">Preparing Codebase Agent&hellip;</div>
 <div id="chat"></div>
 <div id="input-row">
   <textarea id="question" placeholder="Ask anything about your codebase&hellip;"
@@ -185,7 +183,6 @@ function getWebviewContent(): string {
 const vscode = acquireVsCodeApi();
 let isLoading = false;
 
-// ── receive messages from extension host ──────────────────────────
 window.addEventListener('message', e => {
   const msg = e.data;
   if (msg.type === 'status')           setStatus(msg.text, msg.ok);
@@ -205,7 +202,7 @@ function setStatus(text, ok) {
 
 function setWorkspaceLabel(folder) {
   const el = document.getElementById('workspace-label');
-  el.textContent = folder ? 'Workspace: ' + folder : 'Workspace: \u2014';
+  el.textContent = folder ? 'Workspace: ' + folder : 'Workspace: \\u2014';
   el.title = folder ?? '';
 }
 
@@ -224,14 +221,12 @@ function showAnswer(msg) {
   const div = document.createElement('div');
   div.className = 'msg assistant';
 
-  // Render markdown-ish: code blocks and inline code
   let html = escapeHtml(msg.answer)
     .replace(/\`\`\`([\s\S]*?)\`\`\`/g, '<pre>$1</pre>')
     .replace(/\`([^\`]+)\`/g, '<code>$1</code>')
     .replace(/\\n/g, '<br>');
   div.innerHTML = html;
 
-  // Citations
   if (msg.citations && msg.citations.length > 0) {
     const citeDiv = document.createElement('div');
     citeDiv.className = 'citations';
@@ -291,28 +286,266 @@ function clearIndex() {
   vscode.postMessage({ type: 'clearIndex' });
 }
 
-// Initial status check on load
 setTimeout(() => vscode.postMessage({ type: 'checkStatus' }), 500);
 </script>
 </body>
 </html>`;
 }
 
-// ------------------------------------------------------------------ //
-//  Extension activate                                                  //
-// ------------------------------------------------------------------ //
+class ServerManager implements vscode.Disposable {
+  private proc: ChildProcess | null = null;
+  private bootPromise: Promise<void> | null = null;
+  private readonly output = vscode.window.createOutputChannel("Codebase Agent");
+
+  constructor(private readonly ctx: vscode.ExtensionContext) {}
+
+  dispose() {
+    if (this.proc) {
+      this.proc.kill();
+      this.proc = null;
+    }
+    this.output.dispose();
+  }
+
+  async ensureServerReady(progress?: (message: string) => void): Promise<void> {
+    if (await isServerRunning()) {
+      return;
+    }
+
+    if (!this.bootPromise) {
+      this.bootPromise = this.boot(progress).finally(() => {
+        this.bootPromise = null;
+      });
+    }
+
+    return this.bootPromise;
+  }
+
+  async setGroqApiKey(): Promise<boolean> {
+    const value = await vscode.window.showInputBox({
+      title: "Enter your Groq API key",
+      prompt: "This is stored securely in VS Code secret storage.",
+      password: true,
+      ignoreFocusOut: true,
+      placeHolder: "gsk_...",
+      validateInput: (input) => input.trim() ? undefined : "Groq API key is required.",
+    });
+
+    if (!value) {
+      return false;
+    }
+
+    await this.ctx.secrets.store(GROQ_SECRET_KEY, value.trim());
+    if (this.proc) {
+      this.proc.kill();
+      this.proc = null;
+    }
+    vscode.window.showInformationMessage("Groq API key saved. Codebase Agent is ready to start.");
+    return true;
+  }
+
+  private async boot(progress?: (message: string) => void): Promise<void> {
+    if (!await this.ensureGroqKey()) {
+      throw new Error("A Groq API key is required to start Codebase Agent.");
+    }
+
+    progress?.("Preparing local Python runtime...");
+    const runtime = await this.ensureRuntime(progress);
+
+    progress?.("Starting local server...");
+    await this.startServer(runtime, progress);
+  }
+
+  private async ensureGroqKey(): Promise<boolean> {
+    const existing = await this.ctx.secrets.get(GROQ_SECRET_KEY);
+    if (existing) {
+      return true;
+    }
+
+    const choice = await vscode.window.showInformationMessage(
+      "Codebase Agent needs your Groq API key once to start locally.",
+      "Add Groq API Key",
+      "Cancel"
+    );
+    if (choice !== "Add Groq API Key") {
+      return false;
+    }
+
+    return this.setGroqApiKey();
+  }
+
+  private async ensureRuntime(progress?: (message: string) => void): Promise<string> {
+    const storageRoot = this.ctx.globalStorageUri.fsPath;
+    const runtimeRoot = path.join(storageRoot, "runtime");
+    const venvRoot = path.join(runtimeRoot, ".venv");
+    const stampPath = path.join(runtimeRoot, "install.stamp");
+    const pythonConfig = vscode.workspace.getConfiguration("codebaseAgent").get<string>("pythonPath", "").trim();
+
+    await fs.mkdir(runtimeRoot, { recursive: true });
+
+    const basePython = pythonConfig || await this.findPython();
+    const venvPython = process.platform === "win32"
+      ? path.join(venvRoot, "Scripts", "python.exe")
+      : path.join(venvRoot, "bin", "python");
+
+    if (!await this.exists(venvPython)) {
+      progress?.("Creating Python environment...");
+      await this.runCommand(basePython, ["-m", "venv", venvRoot], runtimeRoot);
+    }
+
+    if (!await this.exists(stampPath)) {
+      const serverRoot = this.getServerRoot();
+      const requirementsPath = path.join(serverRoot, "requirements.txt");
+      progress?.("Installing Python dependencies...");
+      await this.runCommand(venvPython, ["-m", "pip", "install", "--upgrade", "pip"], runtimeRoot);
+      await this.runCommand(venvPython, ["-m", "pip", "install", "-r", requirementsPath], runtimeRoot);
+      await fs.writeFile(stampPath, `ready:${Date.now()}\n`, "utf8");
+    }
+
+    return venvPython;
+  }
+
+  private async startServer(pythonPath: string, progress?: (message: string) => void): Promise<void> {
+    if (await isServerRunning()) {
+      return;
+    }
+
+    const groqApiKey = await this.ctx.secrets.get(GROQ_SECRET_KEY);
+    if (!groqApiKey) {
+      throw new Error("Missing Groq API key.");
+    }
+
+    const storageRoot = this.ctx.globalStorageUri.fsPath;
+    const dataRoot = path.join(storageRoot, "data");
+    const serverRoot = this.getServerRoot();
+    await fs.mkdir(dataRoot, { recursive: true });
+
+    this.output.appendLine(`[codebase-agent] Launching server from ${serverRoot}`);
+    this.proc = spawn(
+      pythonPath,
+      ["run_server.py", "--host", "127.0.0.1", "--port", String(SERVER_PORT())],
+      {
+        cwd: serverRoot,
+        env: {
+          ...process.env,
+          PYTHONUNBUFFERED: "1",
+          GROQ_API_KEY: groqApiKey,
+          CHROMA_PATH: path.join(dataRoot, "chroma"),
+          SQLITE_PATH: path.join(dataRoot, "symbols.db"),
+        },
+      }
+    );
+
+    this.proc.stdout?.on("data", (chunk) => this.output.append(chunk.toString()));
+    this.proc.stderr?.on("data", (chunk) => this.output.append(chunk.toString()));
+    this.proc.on("exit", (code, signal) => {
+      this.output.appendLine(`[codebase-agent] Server exited (code=${code}, signal=${signal})`);
+      this.proc = null;
+    });
+
+    const started = await this.waitForHealth();
+    if (!started) {
+      this.output.show(true);
+      throw new Error("The local Codebase Agent server did not start. Check the 'Codebase Agent' output panel.");
+    }
+
+    progress?.("Server ready.");
+  }
+
+  private getServerRoot(): string {
+    const configured = vscode.workspace.getConfiguration("codebaseAgent").get<string>("serverPath", "").trim();
+    if (configured) {
+      return configured;
+    }
+
+    const bundled = path.join(this.ctx.extensionPath, "server");
+    return bundled;
+  }
+
+  private async waitForHealth(): Promise<boolean> {
+    const deadline = Date.now() + SERVER_START_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      if (await isServerRunning()) {
+        return true;
+      }
+      if (this.proc && this.proc.exitCode !== null) {
+        break;
+      }
+      await delay(1000);
+    }
+    return false;
+  }
+
+  private async findPython(): Promise<string> {
+    const candidates: Array<[string, string[]]> = process.platform === "win32"
+      ? [["py", ["-3", "--version"]], ["python", ["--version"]]]
+      : [["python3", ["--version"]], ["python", ["--version"]]];
+
+    for (const [cmd, args] of candidates) {
+      try {
+        await this.runCommand(cmd, args, this.ctx.extensionPath, false);
+        return cmd;
+      } catch {
+        continue;
+      }
+    }
+
+    throw new Error("Python 3.10+ was not found. Install Python or set codebaseAgent.pythonPath.");
+  }
+
+  private runCommand(cmd: string, args: string[], cwd: string, log = true): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (log) {
+        this.output.appendLine(`[codebase-agent] ${cmd} ${args.join(" ")}`);
+      }
+
+      const child = spawn(cmd, args, { cwd, env: process.env });
+      let stderr = "";
+
+      child.stdout?.on("data", (chunk) => {
+        if (log) {
+          this.output.append(chunk.toString());
+        }
+      });
+      child.stderr?.on("data", (chunk) => {
+        const text = chunk.toString();
+        stderr += text;
+        if (log) {
+          this.output.append(text);
+        }
+      });
+      child.on("error", reject);
+      child.on("exit", (code) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(new Error(stderr.trim() || `${cmd} exited with code ${code}`));
+        }
+      });
+    });
+  }
+
+  private async exists(target: string): Promise<boolean> {
+    try {
+      await fs.access(target);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
 
 export function activate(context: vscode.ExtensionContext) {
   console.log("[codebase-agent] Extension activated");
 
-  const provider = new ChatViewProvider(context);
+  const serverManager = new ServerManager(context);
+  const provider = new ChatViewProvider(context, serverManager);
+
+  context.subscriptions.push(serverManager);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider("codebaseAgent.chatView", provider)
   );
 
-  // KEY FIX: listen for workspace folder changes.
-  // When the user opens a different folder, clear the stale server index
-  // so old chunks from the previous project don't pollute results.
   context.subscriptions.push(
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
       const folders = vscode.workspace.workspaceFolders;
@@ -323,13 +556,12 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
     vscode.commands.registerCommand("codebaseAgent.indexWorkspace", async () => {
-      // Always read workspaceFolders at call time — never use a cached value
       const folders = vscode.workspace.workspaceFolders;
       if (!folders || folders.length === 0) {
         vscode.window.showErrorMessage("No workspace folder open.");
         return;
       }
-      provider.triggerIndex(folders[0].uri.fsPath);
+      await provider.triggerIndex(folders[0].uri.fsPath);
     })
   );
 
@@ -342,7 +574,7 @@ export function activate(context: vscode.ExtensionContext) {
         openLabel: "Index this folder",
       });
       if (uri && uri[0]) {
-        provider.triggerIndex(uri[0].fsPath);
+        await provider.triggerIndex(uri[0].fsPath);
       }
     })
   );
@@ -359,22 +591,24 @@ export function activate(context: vscode.ExtensionContext) {
       }
     })
   );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codebaseAgent.setGroqApiKey", async () => {
+      await serverManager.setGroqApiKey();
+    })
+  );
 }
 
 export function deactivate() {}
 
-// ------------------------------------------------------------------ //
-//  ChatViewProvider                                                    //
-// ------------------------------------------------------------------ //
-
 class ChatViewProvider implements vscode.WebviewViewProvider {
   private _view?: vscode.WebviewView;
-
-  // Tracks which folder path is currently indexed on the server.
-  // This is the source of truth for detecting stale-index situations.
   private _indexedRoot: string | null = null;
 
-  constructor(private readonly _ctx: vscode.ExtensionContext) {}
+  constructor(
+    private readonly _ctx: vscode.ExtensionContext,
+    private readonly _serverManager: ServerManager
+  ) {}
 
   resolveWebviewView(
     webviewView: vscode.WebviewView,
@@ -385,7 +619,6 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     webviewView.webview.options = { enableScripts: true };
     webviewView.webview.html = getWebviewContent();
 
-    // Push current workspace name to freshly mounted webview
     const folders = vscode.workspace.workspaceFolders;
     if (folders && folders.length > 0) {
       this._notifyWorkspace(folders[0].uri.fsPath);
@@ -398,21 +631,19 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
 
         case "indexWorkspace": {
-          // Always resolve fresh at message-handling time — never use a cached path
-          const folders = vscode.workspace.workspaceFolders;
-          if (folders && folders.length > 0) {
-            this.triggerIndex(folders[0].uri.fsPath);
+          const currentFolders = vscode.workspace.workspaceFolders;
+          if (currentFolders && currentFolders.length > 0) {
+            await this.triggerIndex(currentFolders[0].uri.fsPath);
           } else {
             this._post({
               type: "system",
-              text: "No workspace folder open. Use 'Index folder\u2026' to pick one manually.",
+              text: "No workspace folder open. Use 'Index folder…' to pick one manually.",
             });
           }
           break;
         }
 
         case "pickFolder": {
-          // Lets user index any folder regardless of what VS Code has open
           const uri = await vscode.window.showOpenDialog({
             canSelectFolders: true,
             canSelectFiles: false,
@@ -420,7 +651,7 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
             openLabel: "Index this folder",
           });
           if (uri && uri[0]) {
-            this.triggerIndex(uri[0].fsPath);
+            await this.triggerIndex(uri[0].fsPath);
           }
           break;
         }
@@ -440,28 +671,60 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  // Called by the onDidChangeWorkspaceFolders listener in activate().
-  // Detects when a different folder is opened and clears the stale index.
   onWorkspaceFolderChanged(newRoot: string | null) {
     const label = newRoot ? path.basename(newRoot) : "none";
 
     if (newRoot !== this._indexedRoot) {
-      // The new workspace folder differs from what's currently indexed —
-      // wipe the server index so old chunks don't pollute results.
       this._clearIndexSilent().then(() => {
         this._post({
           type: "status",
-          text: `Workspace changed to "${label}" \u2014 index cleared. Click "Index workspace" to re-index.`,
+          text: `Workspace changed to "${label}" — index cleared. Click "Index workspace" to re-index.`,
           ok: false,
         });
         this._post({
           type: "system",
-          text: `Switched to "${label}". Old index cleared \u2014 click "Index workspace" to index this folder.`,
+          text: `Switched to "${label}". Old index cleared — click "Index workspace" to index this folder.`,
         });
       });
     }
 
     this._notifyWorkspace(newRoot);
+  }
+
+  async triggerIndex(folderPath: string) {
+    this._indexedRoot = folderPath;
+    this._notifyWorkspace(folderPath);
+    this._post({ type: "system", text: `Indexing ${folderPath} ...` });
+
+    try {
+      await this._serverManager.ensureServerReady((message) => {
+        this._post({ type: "status", text: message, ok: false });
+      });
+      await httpPost("/index", { root_path: folderPath });
+      this._post({ type: "system", text: "Indexing started — this may take a minute." });
+      this.pollUntilIndexed();
+    } catch (e: any) {
+      this._post({
+        type: "system",
+        text: `Index error: ${e.message}`,
+      });
+      this._post({
+        type: "status",
+        text: "Codebase Agent could not start.",
+        ok: false,
+      });
+    }
+  }
+
+  clearIndex() {
+    this._clearIndexSilent()
+      .then(() => {
+        this._post({ type: "system", text: "Index cleared." });
+        this._post({ type: "status", text: "Index cleared.", ok: false });
+      })
+      .catch(() => {
+        this._post({ type: "system", text: "Could not reach server to clear index." });
+      });
   }
 
   private _notifyWorkspace(folderPath: string | null) {
@@ -475,23 +738,26 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private async _checkStatus() {
     try {
+      await this._serverManager.ensureServerReady((message) => {
+        this._post({ type: "status", text: message, ok: false });
+      });
       const data = await httpGet("/status");
-      const chunks   = data.total_chunks ?? 0;
-      const files    = data.total_files  ?? 0;
-      const root     = data.root_path    ?? this._indexedRoot ?? "unknown";
-      const indexing = data.is_indexing  ? " (indexing\u2026)" : "";
-      const shortRoot = path.basename(root);
+      const chunks = data.total_chunks ?? 0;
+      const files = data.total_files ?? 0;
+      const root = data.root_path ?? this._indexedRoot ?? "unknown";
+      const indexing = data.is_indexing ? " (indexing...)" : "";
+      const shortRoot = root && root !== "unknown" ? path.basename(root) : "workspace";
       this._post({
         type: "status",
         text: chunks > 0
           ? `Indexed ${chunks} chunks from ${files} files in "${shortRoot}"${indexing}`
-          : `Server connected \u2014 no index yet. Click "Index workspace".`,
+          : "Server connected — no index yet. Click 'Index workspace'.",
         ok: true,
       });
-    } catch {
+    } catch (e: any) {
       this._post({
         type: "status",
-        text: "Server not running. Start it: python3 run_server.py",
+        text: e.message || "Server setup failed.",
         ok: false,
       });
     }
@@ -500,6 +766,9 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
   private async _handleQuery(question: string) {
     this._post({ type: "loading", value: true });
     try {
+      await this._serverManager.ensureServerReady((message) => {
+        this._post({ type: "status", text: message, ok: false });
+      });
       const data = await httpPost("/query", { question, top_k: 8 });
       if (data.detail) {
         this._post({ type: "answer", answer: data.detail, citations: [] });
@@ -514,7 +783,7 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     } catch (e: any) {
       this._post({
         type: "answer",
-        answer: `Error: ${e.message}. Is the server running on port ${SERVER_PORT()}?`,
+        answer: `Error: ${e.message}`,
         citations: [],
       });
     } finally {
@@ -522,59 +791,34 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  triggerIndex(folderPath: string) {
-    this._indexedRoot = folderPath;   // record what is now being indexed
-    this._notifyWorkspace(folderPath);
-    this._post({ type: "system", text: `Indexing ${folderPath} \u2026` });
-
-    httpPost("/index", { root_path: folderPath })
-      .then(() => {
-        this._post({ type: "system", text: "Indexing started \u2014 this may take a minute." });
-
-        // Poll until the server finishes
-        const poll = setInterval(async () => {
-          try {
-            const s = await httpGet("/status");
-            if (!s.is_indexing) {
-              clearInterval(poll);
-              this._post({
-                type: "status",
-                text: `Indexed ${s.total_chunks} chunks from ${s.total_files} files`,
-                ok: true,
-              });
-              this._post({
-                type: "system",
-                text: `Done! ${s.total_chunks} chunks ready. Ask me anything.`,
-              });
-            }
-          } catch {
-            clearInterval(poll);
-          }
-        }, 3000);
-      })
-      .catch((e) => {
-        this._post({ type: "system", text: `Index error: ${e.message}` });
-      });
+  private pollUntilIndexed() {
+    const poll = setInterval(async () => {
+      try {
+        const s = await httpGet("/status");
+        if (!s.is_indexing) {
+          clearInterval(poll);
+          this._post({
+            type: "status",
+            text: `Indexed ${s.total_chunks} chunks from ${s.total_files} files`,
+            ok: true,
+          });
+          this._post({
+            type: "system",
+            text: `Done! ${s.total_chunks} chunks ready. Ask me anything.`,
+          });
+        }
+      } catch {
+        clearInterval(poll);
+      }
+    }, 3000);
   }
 
-  clearIndex() {
-    this._clearIndexSilent()
-      .then(() => {
-        this._post({ type: "system", text: "Index cleared." });
-        this._post({ type: "status", text: "Index cleared.", ok: false });
-      })
-      .catch(() => {
-        this._post({ type: "system", text: "Could not reach server to clear index." });
-      });
-  }
-
-  // Clears the server index without any UI messages.
-  // Used internally when workspace switches to avoid stale results.
   private async _clearIndexSilent(): Promise<void> {
     try {
+      await this._serverManager.ensureServerReady();
       await httpDelete("/index");
     } catch {
-      // Server may not be running — nothing to clear, that is fine
+      // Ignore setup/connection issues while silently clearing.
     } finally {
       this._indexedRoot = null;
     }
