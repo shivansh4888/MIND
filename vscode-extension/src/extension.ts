@@ -70,6 +70,27 @@ function httpGet(endpoint: string): Promise<any> {
   });
 }
 
+// NEW: proper httpDelete helper — the old code inlined a raw http.request
+// in clearIndex() and never resolved it properly.
+function httpDelete(endpoint: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        hostname: "127.0.0.1",
+        port: SERVER_PORT(),
+        path: endpoint,
+        method: "DELETE",
+      },
+      (res) => {
+        res.resume();
+        res.on("end", () => resolve());
+      }
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
 async function isServerRunning(): Promise<boolean> {
   try {
     await httpGet("/health");
@@ -103,6 +124,10 @@ function getWebviewContent(): string {
   button:hover{background:var(--vscode-button-hoverBackground)}
   button.secondary{background:var(--vscode-button-secondaryBackground);
                    color:var(--vscode-button-secondaryForeground)}
+  #workspace-label{font-size:11px;padding:4px 8px;
+                   color:var(--vscode-descriptionForeground);
+                   border-bottom:1px solid var(--vscode-panel-border);
+                   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   #status{font-size:11px;padding:4px 8px;
           color:var(--vscode-descriptionForeground);
           border-bottom:1px solid var(--vscode-panel-border)}
@@ -143,13 +168,15 @@ function getWebviewContent(): string {
 <body>
 <div id="toolbar">
   <button onclick="indexWorkspace()">Index workspace</button>
+  <button class="secondary" onclick="pickFolder()">Index folder&hellip;</button>
   <button class="secondary" onclick="checkStatus()">Status</button>
   <button class="secondary" onclick="clearIndex()">Clear index</button>
 </div>
-<div id="status">Not connected — make sure the sidecar server is running.</div>
+<div id="workspace-label">Workspace: &mdash;</div>
+<div id="status">Not connected &mdash; make sure the sidecar server is running.</div>
 <div id="chat"></div>
 <div id="input-row">
-  <textarea id="question" placeholder="Ask anything about your codebase…"
+  <textarea id="question" placeholder="Ask anything about your codebase&hellip;"
     onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendQuestion()}"></textarea>
   <button id="send" onclick="sendQuestion()">Ask</button>
 </div>
@@ -161,10 +188,11 @@ let isLoading = false;
 // ── receive messages from extension host ──────────────────────────
 window.addEventListener('message', e => {
   const msg = e.data;
-  if (msg.type === 'status')   setStatus(msg.text, msg.ok);
-  if (msg.type === 'answer')   showAnswer(msg);
-  if (msg.type === 'system')   addMsg(msg.text, 'system');
-  if (msg.type === 'loading')  setLoading(msg.value);
+  if (msg.type === 'status')           setStatus(msg.text, msg.ok);
+  if (msg.type === 'answer')           showAnswer(msg);
+  if (msg.type === 'system')           addMsg(msg.text, 'system');
+  if (msg.type === 'loading')          setLoading(msg.value);
+  if (msg.type === 'workspaceChanged') setWorkspaceLabel(msg.folder);
 });
 
 function setStatus(text, ok) {
@@ -173,6 +201,12 @@ function setStatus(text, ok) {
   el.style.color = ok
     ? 'var(--vscode-testing-iconPassed)'
     : 'var(--vscode-descriptionForeground)';
+}
+
+function setWorkspaceLabel(folder) {
+  const el = document.getElementById('workspace-label');
+  el.textContent = folder ? 'Workspace: ' + folder : 'Workspace: \u2014';
+  el.title = folder ?? '';
 }
 
 function addMsg(text, role) {
@@ -192,7 +226,7 @@ function showAnswer(msg) {
 
   // Render markdown-ish: code blocks and inline code
   let html = escapeHtml(msg.answer)
-    .replace(/\`\`\`([\\s\\S]*?)\`\`\`/g, '<pre>$1</pre>')
+    .replace(/\`\`\`([\s\S]*?)\`\`\`/g, '<pre>$1</pre>')
     .replace(/\`([^\`]+)\`/g, '<code>$1</code>')
     .replace(/\\n/g, '<br>');
   div.innerHTML = html;
@@ -245,6 +279,10 @@ function indexWorkspace() {
   vscode.postMessage({ type: 'indexWorkspace' });
 }
 
+function pickFolder() {
+  vscode.postMessage({ type: 'pickFolder' });
+}
+
 function checkStatus() {
   vscode.postMessage({ type: 'checkStatus' });
 }
@@ -267,15 +305,25 @@ setTimeout(() => vscode.postMessage({ type: 'checkStatus' }), 500);
 export function activate(context: vscode.ExtensionContext) {
   console.log("[codebase-agent] Extension activated");
 
-  // ── Webview provider ──────────────────────────────────────────────
   const provider = new ChatViewProvider(context);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider("codebaseAgent.chatView", provider)
   );
 
-  // ── Commands ──────────────────────────────────────────────────────
+  // KEY FIX: listen for workspace folder changes.
+  // When the user opens a different folder, clear the stale server index
+  // so old chunks from the previous project don't pollute results.
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      const folders = vscode.workspace.workspaceFolders;
+      const newRoot = folders && folders.length > 0 ? folders[0].uri.fsPath : null;
+      provider.onWorkspaceFolderChanged(newRoot);
+    })
+  );
+
   context.subscriptions.push(
     vscode.commands.registerCommand("codebaseAgent.indexWorkspace", async () => {
+      // Always read workspaceFolders at call time — never use a cached value
       const folders = vscode.workspace.workspaceFolders;
       if (!folders || folders.length === 0) {
         vscode.window.showErrorMessage("No workspace folder open.");
@@ -322,6 +370,10 @@ export function deactivate() {}
 class ChatViewProvider implements vscode.WebviewViewProvider {
   private _view?: vscode.WebviewView;
 
+  // Tracks which folder path is currently indexed on the server.
+  // This is the source of truth for detecting stale-index situations.
+  private _indexedRoot: string | null = null;
+
   constructor(private readonly _ctx: vscode.ExtensionContext) {}
 
   resolveWebviewView(
@@ -333,31 +385,88 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     webviewView.webview.options = { enableScripts: true };
     webviewView.webview.html = getWebviewContent();
 
+    // Push current workspace name to freshly mounted webview
+    const folders = vscode.workspace.workspaceFolders;
+    if (folders && folders.length > 0) {
+      this._notifyWorkspace(folders[0].uri.fsPath);
+    }
+
     webviewView.webview.onDidReceiveMessage(async (msg) => {
       switch (msg.type) {
         case "query":
           await this._handleQuery(msg.question);
           break;
+
         case "indexWorkspace": {
+          // Always resolve fresh at message-handling time — never use a cached path
           const folders = vscode.workspace.workspaceFolders;
           if (folders && folders.length > 0) {
             this.triggerIndex(folders[0].uri.fsPath);
           } else {
-            this._post({ type: "system", text: "No workspace folder open." });
+            this._post({
+              type: "system",
+              text: "No workspace folder open. Use 'Index folder\u2026' to pick one manually.",
+            });
           }
           break;
         }
+
+        case "pickFolder": {
+          // Lets user index any folder regardless of what VS Code has open
+          const uri = await vscode.window.showOpenDialog({
+            canSelectFolders: true,
+            canSelectFiles: false,
+            canSelectMany: false,
+            openLabel: "Index this folder",
+          });
+          if (uri && uri[0]) {
+            this.triggerIndex(uri[0].fsPath);
+          }
+          break;
+        }
+
         case "checkStatus":
           await this._checkStatus();
           break;
+
         case "clearIndex":
           this.clearIndex();
           break;
+
         case "openFile":
           this._openFile(msg.file, msg.line);
           break;
       }
     });
+  }
+
+  // Called by the onDidChangeWorkspaceFolders listener in activate().
+  // Detects when a different folder is opened and clears the stale index.
+  onWorkspaceFolderChanged(newRoot: string | null) {
+    const label = newRoot ? path.basename(newRoot) : "none";
+
+    if (newRoot !== this._indexedRoot) {
+      // The new workspace folder differs from what's currently indexed —
+      // wipe the server index so old chunks don't pollute results.
+      this._clearIndexSilent().then(() => {
+        this._post({
+          type: "status",
+          text: `Workspace changed to "${label}" \u2014 index cleared. Click "Index workspace" to re-index.`,
+          ok: false,
+        });
+        this._post({
+          type: "system",
+          text: `Switched to "${label}". Old index cleared \u2014 click "Index workspace" to index this folder.`,
+        });
+      });
+    }
+
+    this._notifyWorkspace(newRoot);
+  }
+
+  private _notifyWorkspace(folderPath: string | null) {
+    const short = folderPath ? path.basename(folderPath) : null;
+    this._post({ type: "workspaceChanged", folder: short });
   }
 
   private _post(msg: object) {
@@ -367,14 +476,16 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
   private async _checkStatus() {
     try {
       const data = await httpGet("/status");
-      const chunks = data.total_chunks ?? 0;
-      const files  = data.total_files ?? 0;
-      const indexing = data.is_indexing ? " (indexing…)" : "";
+      const chunks   = data.total_chunks ?? 0;
+      const files    = data.total_files  ?? 0;
+      const root     = data.root_path    ?? this._indexedRoot ?? "unknown";
+      const indexing = data.is_indexing  ? " (indexing\u2026)" : "";
+      const shortRoot = path.basename(root);
       this._post({
         type: "status",
         text: chunks > 0
-          ? `Indexed ${chunks} chunks from ${files} files${indexing}`
-          : `Server connected — no index yet. Click "Index workspace".`,
+          ? `Indexed ${chunks} chunks from ${files} files in "${shortRoot}"${indexing}`
+          : `Server connected \u2014 no index yet. Click "Index workspace".`,
         ok: true,
       });
     } catch {
@@ -412,11 +523,15 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   triggerIndex(folderPath: string) {
-    this._post({ type: "system", text: `Indexing ${folderPath} …` });
+    this._indexedRoot = folderPath;   // record what is now being indexed
+    this._notifyWorkspace(folderPath);
+    this._post({ type: "system", text: `Indexing ${folderPath} \u2026` });
+
     httpPost("/index", { root_path: folderPath })
       .then(() => {
-        this._post({ type: "system", text: "Indexing started — this may take a minute." });
-        // Poll until done
+        this._post({ type: "system", text: "Indexing started \u2014 this may take a minute." });
+
+        // Poll until the server finishes
         const poll = setInterval(async () => {
           try {
             const s = await httpGet("/status");
@@ -443,20 +558,26 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   clearIndex() {
-    httpPost("/index", {})   // will fail gracefully
-      .catch(() => {});
-    // Use DELETE via raw http
-    const req = http.request({
-      hostname: "127.0.0.1",
-      port: SERVER_PORT(),
-      path: "/index",
-      method: "DELETE",
-    }, (res) => {
-      this._post({ type: "system", text: "Index cleared." });
-      this._post({ type: "status", text: "Index cleared.", ok: false });
-    });
-    req.on("error", () => {});
-    req.end();
+    this._clearIndexSilent()
+      .then(() => {
+        this._post({ type: "system", text: "Index cleared." });
+        this._post({ type: "status", text: "Index cleared.", ok: false });
+      })
+      .catch(() => {
+        this._post({ type: "system", text: "Could not reach server to clear index." });
+      });
+  }
+
+  // Clears the server index without any UI messages.
+  // Used internally when workspace switches to avoid stale results.
+  private async _clearIndexSilent(): Promise<void> {
+    try {
+      await httpDelete("/index");
+    } catch {
+      // Server may not be running — nothing to clear, that is fine
+    } finally {
+      this._indexedRoot = null;
+    }
   }
 
   private _openFile(filePath: string, line: number) {

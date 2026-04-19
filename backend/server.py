@@ -74,6 +74,7 @@ async def index(req: IndexRequest):
         raise HTTPException(status_code=409, detail="Indexing already in progress")
 
     current_root = str(root)
+    index_status = IndexStatus(is_indexing=True, root_path=current_root)
 
     def _run():
         global index_status, file_watcher
@@ -122,18 +123,12 @@ async def query(req: QueryRequest):
 
 @app.delete("/index")
 async def clear_index():
-    global index_status
-    try:
-        ingestion_agent.collection.delete(
-            where={"chunk_type": {"$ne": "__never__"}}
-        )
-    except Exception:
-        pass
-    import sqlite3
-    conn = sqlite3.connect("data/symbols.db")
-    conn.execute("DELETE FROM symbols")
-    conn.commit()
-    conn.close()
+    global index_status, current_root, file_watcher
+    if file_watcher:
+        file_watcher.stop()
+        file_watcher = None
+    current_root = ""
+    ingestion_agent.clear_index()
     index_status = IndexStatus()
     CHUNKS_INDEXED.set(0)
     return {"message": "Index cleared"}

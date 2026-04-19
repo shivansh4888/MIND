@@ -78,12 +78,24 @@ class IngestionAgent:
         # Ensure table exists in main thread too
         _get_db()
 
+    def clear_index(self) -> None:
+        """Remove all indexed chunks before a new full-project index."""
+        try:
+            self.collection.delete(where={"chunk_type": {"$ne": "__never__"}})
+        except Exception as e:
+            print(f"[ingestion] Chroma clear error: {e}")
+
+        db = _get_db()
+        db.execute("DELETE FROM symbols")
+        db.commit()
+
     def index_project(
         self,
         root_path: str,
         progress_cb: Optional[Callable[[str, int, int], None]] = None,
     ) -> IndexStatus:
-        self.status = IndexStatus(is_indexing=True)
+        self.status = IndexStatus(is_indexing=True, root_path=root_path)
+        self.clear_index()
         files = _collect_files(root_path)
         self.status.total_files = len(files)
 

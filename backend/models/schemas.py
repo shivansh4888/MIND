@@ -26,6 +26,7 @@ class CodeChunk(BaseModel):
 
 
 class IndexStatus(BaseModel):
+    root_path: str = ""
     total_files: int = 0
     total_chunks: int = 0
     indexed_files: list[str] = Field(default_factory=list)
